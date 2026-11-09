@@ -58,9 +58,22 @@
     INACTIVE_DAYS: 90,            // 死粉阈值（天）
     SYNC_PAGE_SIZE: 50,           // 同步关注列表每页大小
     MAX_RETRY: 3,                 // 失败重试次数（仅 GET 走满）
-    REQUEST_TIMEOUT_MS: 30_000,   // 防止单个 B站请求挂起并卡死串行队列
+    REQUEST_TIMEOUT_MS: 30_000,   // 通用/写操作超时（保持原值，语义不变）
     API_BASE: 'https://api.bilibili.com',
     PANEL_WIDTH: 480,             // 抽屉宽度
+    // ====== FAST v1：活跃度读取链路性能参数 ======
+    LATEST_VIDEO_TIMEOUT_MS: 8_000,  // 单条活跃度 GET 超时（原 30s 会拖垮整轮）
+    READ_CONCURRENCY: 6,             // 活跃度读池并发上限（写路径仍严格串行）
+    READ_MIN_GAP_MS: 80,             // 全局最小发车间距，控制整体 QPS 上限
+    READ_RETRY: 1,                   // 活跃度 GET 失败只重试 1 次
+    LLM_CONCURRENCY: 2,              // LLM 独立通道，不再与 B 站读请求争抢队列
+    INACTIVE_TTL_HOURS: 24,          // 活跃度结果有效期，到期才复查（force 可绕过）
+    INACTIVE_RENDER_LIMIT: 100,      // 死粉列表单次渲染上限（与分组页一致）
+    RISK_COOLDOWN_MS: 30_000,        // 触发 -352/-412 后的冷却时长
+    RISK_RECOVERY_STREAK: 50,        // 连续成功多少次后缓慢恢复并发
+    // FIX v1.3：动态流 DOM 隐藏默认关闭。v1.2 曾把整页容器误判为卡片隐藏，
+    // 导致点击分组后页面只剩背景。默认只用「分组速览」呈现，用户可在速览里手动开启。
+    ENABLE_FEED_HIDE: false,
     // ====== v0.10.6 写入节流（P0 修复） ======
     // 社区调研（wuko233 / YZz-S / MrXJG 等）：
     // 固定小间隔 + 重试无法解决 -352；必须随机秒级延迟 + 遇险即停 + 可续跑。
@@ -226,6 +239,120 @@
         await this._sleep(CONFIG.RATE_LIMIT_MS);
       }
       this._busy = false;
+    },
+
+    // ===== FAST v1：分层调度 =====
+    // 写路径（分组/取关）继续走上面的串行队列 + 200ms，风控节流语义完全不变。
+    // 读路径（活跃度检测）走独立有界并发池，避免 1300 个请求被 200ms 强制间隔串行化。
+    // LLM 走第三条通道，避免与 B 站请求互相阻塞。
+    _pools: {
+      read: { queue: [], waiters: [], active: 0, concurrency: CONFIG.READ_CONCURRENCY,
+              gap: CONFIG.READ_MIN_GAP_MS, lastStart: 0, streak: 0,
+              riskUntil: 0, aborted: null, busy: false },
+      llm:  { queue: [], waiters: [], active: 0, concurrency: CONFIG.LLM_CONCURRENCY,
+              gap: 0, lastStart: 0, busy: false },
+    },
+
+    enqueueRead(fn) { return this._poolEnqueue('read', fn); },
+    enqueueLLM(fn)  { return this._poolEnqueue('llm', fn); },
+
+    _poolEnqueue(lane, fn) {
+      return new Promise((resolve, reject) => {
+        this._pools[lane].queue.push({ fn, resolve, reject });
+        this._poolDrain(lane);
+      });
+    },
+
+    async _poolDrain(lane) {
+      const p = this._pools[lane];
+      if (p.busy) return;
+      p.busy = true;
+      while (p.queue.length) {
+        // 遇险即停 / 冷却期：立即丢弃未发任务并返回，绝不在 drain 里空转等待冷却
+        // （早期版本在这里 sleep 到冷却结束，反而让整轮挂 30~60 秒，已修正）
+        if (p.aborted || (p.riskUntil && Date.now() < p.riskUntil)) {
+          const reason = p.aborted || 'cooldown';
+          p.aborted = reason;
+          const pending = p.queue.splice(0);
+          for (const j of pending) j.reject(new Error('POOL_ABORTED:' + reason));
+          this._poolWake(p);
+          break;
+        }
+        // FIX v1.1：Promise 信号量代替 5ms 忙轮询。
+        // 原实现在 1300 个请求期间会创建数万个短定时器，是浏览器卡顿的主因之一。
+        while (p.active >= p.concurrency && p.queue.length) {
+          await new Promise(res => p.waiters.push(res));
+        }
+        if (p.aborted || (p.riskUntil && Date.now() < p.riskUntil)) {
+          const pending = p.queue.splice(0);
+          for (const j of pending) j.reject(new Error('POOL_ABORTED:cooldown'));
+          this._poolWake(p);
+          break;
+        }
+        if (!p.queue.length) break;
+        const job = p.queue.shift();
+        p.active++;
+        // 全局最小发车间距只推迟「发起」时刻，不惩罚单个请求的往返延迟
+        if (p.gap > 0) {
+          const wait = p.lastStart + p.gap - Date.now();
+          if (wait > 0) await this._sleep(wait);
+          p.lastStart = Date.now();
+        }
+        (async () => {
+          try { job.resolve(await job.fn()); }
+          catch (e) { job.reject(e); }
+          finally {
+            p.active--;
+            const w = p.waiters.shift();
+            if (w) w();
+          }
+        })();
+      }
+      p.busy = false;
+      // 竞态兜底：drain 结束瞬间新入队的任务不能被漏掉
+      if (p.queue.length) this._poolDrain(lane);
+    },
+
+    // 风控自适应降速（AIMD 的 MD 部分），保留「遇险即停」语义
+    poolRisk(lane, err) {
+      const p = this._pools?.[lane];
+      if (!p) return;
+      p.concurrency = 1;
+      p.gap = Math.max(p.gap, 1500);
+      p.streak = 0;
+      // 幂等：多个在途请求同时报风控时，不要反复把冷却窗口往后推
+      if (!(p.riskUntil > Date.now())) p.riskUntil = Date.now() + CONFIG.RISK_COOLDOWN_MS;
+      utils.warn(`[${lane}] 风控降速：并发=1 gap=${p.gap}ms 冷却 ${CONFIG.RISK_COOLDOWN_MS / 1000}s`, String(err?.message || err));
+    },
+
+    // 立即中止读池：清空未发队列并 reject，避免 worker 挂在永远不会被消费的 Promise 上
+    poolAbort(lane, reason) {
+      const p = this._pools?.[lane];
+      if (!p) return;
+      p.aborted = reason;
+      const pending = p.queue.splice(0);
+      for (const j of pending) j.reject(new Error('POOL_ABORTED:' + reason));
+      this._poolWake(p);
+    },
+
+    // 唤醒所有等待并发槽的 drain，防止中止后残留挂起的 Promise
+    _poolWake(p) {
+      const ws = p.waiters.splice(0);
+      for (const w of ws) w();
+    },
+
+    // 连续成功后缓慢恢复（AIMD 的 AI 部分）
+    poolSuccess(lane) {
+      const p = this._pools?.[lane];
+      if (!p || !CONFIG.RISK_RECOVERY_STREAK) return;
+      if (p.concurrency >= CONFIG.READ_CONCURRENCY && p.gap <= CONFIG.READ_MIN_GAP_MS) return;
+      p.streak = (p.streak || 0) + 1;
+      if (p.streak < CONFIG.RISK_RECOVERY_STREAK) return;
+      p.streak = 0;
+      p.gap = Math.max(CONFIG.READ_MIN_GAP_MS, Math.floor(p.gap * 0.8));
+      if (p.gap <= CONFIG.READ_MIN_GAP_MS) {
+        p.concurrency = Math.min(CONFIG.READ_CONCURRENCY, p.concurrency + 1);
+      }
     },
 
     sleep(ms) { return new Promise(r => setTimeout(r, ms)); },
@@ -443,6 +570,7 @@
             tagids: Array.isArray(u?.tagids) ? u.tagids.map(Number).filter(Number.isFinite) : [],
             mtime: Number(u?.mtime) || 0,
             lastActive: Number(u?.lastActive) || 0,
+            lastCheckedAt: Number(u?.lastCheckedAt) || 0,
             lastTitle: String(u?.lastTitle ?? '').slice(0, 128),
           };
         }
@@ -637,8 +765,9 @@
     },
 
     // 未检测过的 UP 主（独立于死粉，方便 UI 分段显示）
+    // FAST v1：以 lastCheckedAt 为准，避免「已查过但无投稿」被反复判成未检测
     getUndetected() {
-      return Object.values(this.state.following).filter(u => u && !u.lastActive);
+      return Object.values(this.state.following).filter(u => u && !u.lastCheckedAt);
     },
   };
 
@@ -654,11 +783,17 @@
       // POST 是取关/改分组等不可逆写操作：响应超时或网络断开时无法确认服务端是否已生效。
       // 默认不重试，避免“实际已取关/已加入，但脚本以为失败后又发一次”。
       const defaultRetry = method === 'GET' ? CONFIG.MAX_RETRY : 1;
-      const { body = null, headers = {}, retry = defaultRetry, onRiskAbort } = opts;
-      return utils.enqueue(async () => {
+      const { body = null, headers = {}, retry = defaultRetry, onRiskAbort,
+              lane = 'serial', timeoutMs = CONFIG.REQUEST_TIMEOUT_MS } = opts;
+      // FAST v1：默认仍走原串行队列（写操作、关注列表分页、nav 行为完全不变），
+      // 只有活跃度检测显式指定 lane='read' 才进入有界并发池。
+      const schedule = lane === 'read' ? utils.enqueueRead.bind(utils)
+                     : lane === 'llm'  ? utils.enqueueLLM.bind(utils)
+                     : utils.enqueue.bind(utils);
+      return schedule(async () => {
         for (let attempt = 1; attempt <= retry; attempt++) {
           try {
-            const resp = await this._doRequest(url, method, body, headers);
+            const resp = await this._doRequest(url, method, body, headers, timeoutMs);
             if (resp.code === -101) {
               throw new Error('NOT_LOGGED_IN');
             }
@@ -682,7 +817,8 @@
             }
             if (attempt === retry) throw e;
             // 普通错误维持原短退避（500 / 1000 / 2000）
-            const backoff = 500 * Math.pow(2, attempt - 1);
+            // read lane 已由并发池控速，退避不再按 500/1000/2000 拖长整轮
+            const backoff = lane === 'read' ? 200 : 500 * Math.pow(2, attempt - 1);
             utils.warn(`retry ${attempt}/${retry} for ${url}`, e.message);
             await utils._sleep(backoff);
           }
@@ -690,7 +826,7 @@
       });
     },
 
-    _doRequest(url, method, body, extraHeaders) {
+    _doRequest(url, method, body, extraHeaders, timeoutMs = CONFIG.REQUEST_TIMEOUT_MS) {
       return new Promise((resolve, reject) => {
         const headers = {
           'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -710,7 +846,7 @@
           data: body ? Object.entries(body).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&') : undefined,
           headers,
           responseType: 'json',
-          timeout: CONFIG.REQUEST_TIMEOUT_MS,
+          timeout: timeoutMs,
           anonymous: false,        // 关键：false 才会带浏览器 cookie（true 不带）
           onload(r) {
             try {
@@ -719,7 +855,7 @@
             } catch (e) { reject(e); }
           },
           onerror(e) { reject(new Error('network error')); },
-          ontimeout() { reject(new Error(`timeout after ${CONFIG.REQUEST_TIMEOUT_MS / 1000}s`)); },
+          ontimeout() { reject(new Error(`timeout after ${timeoutMs / 1000}s`)); },
         });
       });
     },
@@ -897,14 +1033,38 @@
     },
 
     // 取 UP 主最新一条视频的发布时间（需要 WBI 签名）
+    // 保持原签名与返回值不变：尾部若有其它调用点不受影响。
     async latestVideo(mid) {
+      const r = await this.latestVideoEx(mid);
+      return r.ok ? { title: r.title, created: r.created, aid: r.aid } : null;
+    },
+
+    /**
+     * FAST v1：结构化结果版活跃度查询。
+     * 原实现把所有异常吞成 null，导致「风控 / 超时 / 未登录」与「无投稿」无法区分，
+     * 熔断信号被吞掉后仍会把剩下上千个请求逐个发完 —— 这就是「一直卡住」的根因。
+     */
+    async latestVideoEx(mid) {
       try {
+        // 每个请求独立签名（wts 为当前秒），并发下不可复用同一串 query
         const qs = await wbi.sign({ mid, pn: 1, ps: 1, order: 'pubdate' });
-        const data = await this.request(`${CONFIG.API_BASE}/x/space/wbi/arc/search?${qs}`);
+        const data = await this.request(`${CONFIG.API_BASE}/x/space/wbi/arc/search?${qs}`, {
+          lane: 'read',
+          retry: CONFIG.READ_RETRY,
+          timeoutMs: CONFIG.LATEST_VIDEO_TIMEOUT_MS,
+        });
         const v = data?.list?.vlist?.[0];
-        if (!v) return null;
-        return { title: v.title, created: v.created * 1000, aid: v.aid };
-      } catch (e) { return null; }
+        if (!v) return { ok: false, reason: 'empty', mid };
+        return { ok: true, mid, title: v.title, created: v.created * 1000, aid: v.aid };
+      } catch (e) {
+        const msg = String(e?.message || e);
+        let reason = 'error';
+        if (/-352|-412/.test(msg)) reason = 'risk';
+        else if (msg === 'NOT_LOGGED_IN' || /-101/.test(msg)) reason = 'auth';
+        else if (/POOL_ABORTED/.test(msg)) reason = 'aborted';
+        else if (/timeout|network/i.test(msg)) reason = 'timeout';
+        return { ok: false, reason, mid, message: msg };
+      }
     },
   };
 
@@ -1075,7 +1235,7 @@
     // OpenAI 兼容协议（DeepSeek/Kimi/Qwen/OpenAI/Gemini/...）
     _chatOpenAI(messages, opts = {}) {
       const cfg = this.getConfig();
-      return utils.enqueue(() => new Promise((resolve, reject) => {
+      return utils.enqueueLLM(() => new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
           method: 'POST',
           url: `${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`,
@@ -1128,7 +1288,7 @@
       };
       if (systemParts.length) body.system = systemParts.join('\n\n');
 
-      return utils.enqueue(() => new Promise((resolve, reject) => {
+      return utils.enqueueLLM(() => new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
           method: 'POST',
           url: `${cfg.baseUrl.replace(/\/$/, '')}/v1/messages`,
@@ -1297,6 +1457,7 @@ ${sample}
   // ============================================================
   const wbi = {
     _keys: null,         // {imgKey, subKey, cachedAt}
+    _keysPromise: null,  // FAST v1：首次并发取 key 的合并 Promise
     _KEY_TTL: 24 * 3600 * 1000,
 
     // 固定的 MixinKeyEncTab（B 站官方）
@@ -1310,14 +1471,24 @@ ${sample}
     async getKeys() {
       const now = Date.now();
       if (this._keys && now - this._keys.cachedAt < this._KEY_TTL) return this._keys;
-      const nav = await api.getNavInfo();
-      const imgUrl = nav.wbi_img?.img_url || '';
-      const subUrl = nav.wbi_img?.sub_url || '';
-      const imgKey = imgUrl.split('/').pop()?.split('.')[0] || '';
-      const subKey = subUrl.split('/').pop()?.split('.')[0] || '';
-      if (!imgKey || !subKey) throw new Error('无法获取 WBI keys');
-      this._keys = { imgKey, subKey, cachedAt: now };
-      return this._keys;
+      // FAST v1：并发读池下多个 latestVideoEx 会同时首次调用，必须合并成一次 nav 请求，
+      // 否则 6 个并发各发一次 → 缓存穿透并可能触发风控。
+      if (this._keysPromise) return this._keysPromise;
+      this._keysPromise = (async () => {
+        try {
+          const nav = await api.getNavInfo();
+          const imgUrl = nav.wbi_img?.img_url || '';
+          const subUrl = nav.wbi_img?.sub_url || '';
+          const imgKey = imgUrl.split('/').pop()?.split('.')[0] || '';
+          const subKey = subUrl.split('/').pop()?.split('.')[0] || '';
+          if (!imgKey || !subKey) throw new Error('无法获取 WBI keys');
+          this._keys = { imgKey, subKey, cachedAt: Date.now() };
+          return this._keys;
+        } finally {
+          this._keysPromise = null;
+        }
+      })();
+      return this._keysPromise;
     },
 
     mixinKey(imgKey, subKey) {
@@ -1379,44 +1550,105 @@ ${sample}
       return { groups, following: merged };
     },
 
-    async refreshInactive(concurrency = 3) {
-      const list = Object.values(storage.state.following);
-      const queue = [...list];
-      let done = 0;
+    /**
+     * FAST v1：增量刷新 + 有界并发 + 遇险即停 + 可中断 + 分批落盘。
+     * 兼容旧调用 refreshInactive(3)（number 视为 worker 数）。
+     * @param {number|Object} opts {force, concurrency, ttlHours, onlyUndetected}
+     *   force=true 保留原「全量刷新」能力；默认只查未检测或已过 TTL 的 UP 主。
+     */
+    async refreshInactive(opts = {}) {
+      const o = typeof opts === 'number' ? { concurrency: opts } : (opts || {});
+      const force = !!o.force;
+      const ttlMs = (o.ttlHours ?? CONFIG.INACTIVE_TTL_HOURS) * 3600 * 1000;
+      const concurrency = Math.max(1, Math.min(o.concurrency || CONFIG.READ_CONCURRENCY,
+                                               CONFIG.READ_CONCURRENCY));
+      const now = Date.now();
+      this._inactiveAbort = false;
+      const rp = utils._pools.read;
+      rp.aborted = null;                       // 新一轮允许重新入队
+
+      const all = Object.values(storage.state.following);
+      const cooldownLeft = (rp.riskUntil || 0) - now;
+      if (cooldownLeft > 0) {
+        // 冷却期不空转、不发请求：立刻给 UI 明确反馈，不静默等 30 秒
+        events.emit('inactive-aborted', {
+          reason: 'cooldown', done: 0, total: 0, waitSec: Math.ceil(cooldownLeft / 1000),
+        });
+        events.emit('inactive-done', { aborted: true, done: 0, total: 0,
+                                      skipped: all.length, failed: 0 });
+        return { done: 0, total: 0, skipped: all.length, failed: 0,
+                 aborted: true, cooldownSec: Math.ceil(cooldownLeft / 1000) };
+      }
+
+      const queue = force ? [...all] : all.filter(u => {
+        if (o.onlyUndetected) return !u.lastCheckedAt;
+        if (!u.lastCheckedAt) return true;              // 从未检测过，必查
+        return (now - u.lastCheckedAt) >= ttlMs;         // 到期复查
+      });
+      const skipped = all.length - queue.length;
+
+      let done = 0, failed = 0, aborted = false;
       const total = queue.length;
-      // 进度节流：每 50 个才更新一次 DOM
       let lastReported = 0;
-      const report = (force = false) => {
-        if (force || done - lastReported >= 50) {
+      const report = (f = false) => {
+        if (f || done - lastReported >= 50) {
           lastReported = done;
-          events.emit('inactive-progress', { done, total });
+          events.emit('inactive-progress', { done, total, skipped });
         }
       };
+      report(true);
 
       const worker = async () => {
-        while (true) {
+        while (queue.length && !this._inactiveAbort) {
           const u = queue.shift();
-          if (!u) break;                     // 队列空或多 worker 竞态拿到 undefined
-          const v = await api.latestVideo(u.mid);
-          if (v) {
-            storage.state.following[u.mid].lastActive = v.created;
-            storage.state.following[u.mid].lastTitle = v.title;
-            // dynamic_ts 与 lastActive 用同一时间戳（最新视频时间）
-            // 后续如果接入真正的"动态时间"接口，可独立更新
-            storage.state.following[u.mid].dynamic_ts = v.created;
-          } else {
-            storage.state.following[u.mid].lastActive = storage.state.following[u.mid].lastActive || 0;
+          if (!u) break;
+          const r = await api.latestVideoEx(u.mid);
+
+          // 真正的「遇险即停」：风控/登录态失效立即中止整轮，剩余请求不再发出
+          // 被 poolAbort 丢弃的待发任务：立即退出，不再取新 UP 主
+          if (r.reason === 'aborted') break;
+          if (!r.ok && (r.reason === 'risk' || r.reason === 'auth')) {
+            utils.poolRisk('read', new Error(r.message || r.reason));
+            utils.poolAbort('read', r.reason);
+            this._inactiveAbort = true;
+            aborted = r.reason;
+            break;
+          }
+          if (!r.ok) failed++;
+
+          const rec = storage.state.following[u.mid];
+          if (rec) {
+            if (r.ok) {
+              rec.lastActive = r.created;
+              rec.lastTitle = r.title;
+              rec.dynamic_ts = r.created;
+            } else {
+              rec.lastActive = rec.lastActive || 0;
+            }
+            // 只有成功或明确「无投稿」才记已检测；超时/错误留待下次增量补查
+            if (r.ok || r.reason === 'empty') rec.lastCheckedAt = Date.now();
           }
           done++;
+          if (r.ok || r.reason === 'empty') utils.poolSuccess('read');
+          // FIX v1.1：原每 100 条同步 JSON.stringify 全表（1300 人约数百 KB），
+          // 在活跃度检测期间反复阻塞主线程；放宽到 200 条，结束时仍有兜底落盘。
+          if (done % 200 === 0) storage.save();
           report();
         }
       };
 
-      await Promise.all(Array(concurrency).fill(0).map(worker));
+      await Promise.all(Array.from({ length: Math.min(concurrency, total || 1) }, worker));
       report(true);
+      const wasAborted = !!aborted;
+      storage.state.lastInactiveRefresh = Date.now();
       storage.save();
-      events.emit('inactive-done');
+      // 总是发 inactive-done，保证原 UI 一定能清进度条并重渲染
+      events.emit('inactive-done', { aborted: wasAborted, done, total, skipped, failed });
+      if (wasAborted) events.emit('inactive-aborted', { reason: aborted, done, total });
+      return { done, total, skipped, failed, aborted: wasAborted };
     },
+
+    abortInactive() { this._inactiveAbort = true; },
   };
 
   // ============================================================
@@ -2087,7 +2319,15 @@ ${sample}
       try {
         GM_registerMenuCommand('打开管理面板', () => this.openPanel());
         GM_registerMenuCommand('同步关注列表', () => this.runSync());
-        GM_registerMenuCommand('刷新活跃度', () => this.runInactiveRefresh());
+        GM_registerMenuCommand('刷新活跃度（增量，快）', () => this.runInactiveRefresh());
+        GM_registerMenuCommand('强制全量刷新活跃度', async () => {
+          this.updateProgress?.('强制全量刷新活跃度');
+          const r = await sync.refreshInactive({ force: true });
+          storage.patch({ lastInactiveRefresh: Date.now() });
+          this.clearProgress?.();
+          this.render();
+          utils.log('强制全量刷新完成', r);
+        });
         GM_registerMenuCommand('导出备份', () => this.exportData());
         GM_registerMenuCommand('导入备份', () => this.importData());
       } catch (e) { utils.warn('menu command failed', e); }
@@ -2102,8 +2342,14 @@ ${sample}
         this.clearProgress();
         this.render();
       });
-      events.on('inactive-progress', ({ done, total }) => {
-        this.updateProgress(`刷新活跃度 ${done}/${total}`);
+      events.on('inactive-progress', ({ done, total, skipped = 0 }) => {
+        this.updateProgress(`刷新活跃度 ${done}/${total}${skipped ? `（跳过 ${skipped} 位近期已检测）` : ''}`);
+      });
+      events.on('inactive-aborted', ({ reason, done, total, waitSec = 0 }) => {
+        const why = reason === 'auth' ? '登录态失效，请重新登录'
+                  : reason === 'cooldown' ? `风控冷却中，还需约 ${waitSec} 秒`
+                  : '触发风控，已自动降速';
+        this.updateProgress(`已中止：${why}（完成 ${done}/${total || 0}），请稍后重试`);
       });
       events.on('inactive-done', () => {
         this.clearProgress();
@@ -2141,7 +2387,7 @@ ${sample}
       if (needRefreshInactive) {
         await utils._sleep(800);
         try {
-          this.updateProgress?.('首次使用：检测活跃度（首次会等几分钟）');
+          this.updateProgress?.('首次使用：检测活跃度（后台并发，可继续浏览）');
           await sync.refreshInactive();
           storage.patch({ lastInactiveRefresh: Date.now() });
           this.clearProgress?.();
@@ -2265,34 +2511,61 @@ ${sample}
       const groups = storage.state.groups || [];
       const following = storage.state.following || {};
       const RENDER_LIMIT = 100;
-      const ungroupedList = Object.values(following).filter(u => !u.tagids || u.tagids.length === 0);
+      // FIX v1.1：一次遍历建 tagid -> UP 列表索引。
+      // 原实现对每个分组都调 midsOfGroup()（每次 Object.values().filter() 全表扫描），
+      // 15+ 个分组 × 1360 人，且每次 render() 都重来一遍。
+      const byTag = new Map();
+      const ungroupedList = [];
+      for (const u of Object.values(following)) {
+        if (!u) continue;
+        const tags = Array.isArray(u.tagids) ? u.tagids : [];
+        if (!tags.length) { ungroupedList.push(u); continue; }
+        for (const t of tags) {
+          if (!byTag.has(t)) byTag.set(t, []);
+          byTag.get(t).push(u);
+        }
+      }
+      // FIX v1.1：默认全部折叠，避免所有分组同时展开产生上千行 DOM。
+      if (!this._collapsed) this._collapsed = new Set(groups.map(g => Number(g.tagid)));
+      // FIX v1.2：记录点过「展开全部」的分组 / 未分组区
+      if (!this._expandedGroups) this._expandedGroups = new Set();
+      const ungroupedExpanded = this._expandedGroups.has('__ungrouped');
+      const ungroupedShown = ungroupedExpanded ? ungroupedList : ungroupedList.slice(0, RENDER_LIMIT);
       const totalUngrouped = ungroupedList.length;
 
       let html = `
         <div class="bfm-section-title">未分组 (${totalUngrouped})</div>
         <div class="bfm-group">
           <div class="bfm-group-body" data-group="__ungrouped">
-            ${this._renderUpList(ungroupedList.slice(0, RENDER_LIMIT))}
-            ${totalUngrouped > RENDER_LIMIT ? `<div class="bfm-empty" style="padding:8px">还有 ${totalUngrouped - RENDER_LIMIT} 个未显示（请用动态页筛选或搜索）</div>` : ''}
+            ${this._renderUpList(ungroupedShown)}
+            ${this._moreHint('__ungrouped', totalUngrouped, ungroupedShown.length, ungroupedExpanded)}
           </div>
         </div>
-        <div class="bfm-section-title">分组列表</div>
+        <div class="bfm-section-title">
+          分组列表
+          <button class="bfm-btn bfm-btn-ghost" id="bfm-expand-all-groups" style="padding:2px 8px;font-size:11px;margin-left:8px">全部展开</button>
+          <button class="bfm-btn bfm-btn-ghost" id="bfm-collapse-all-groups" style="padding:2px 8px;font-size:11px">全部折叠</button>
+          <span style="display:block;font-size:11px;color:var(--bfm-text-3);font-weight:400;margin-top:4px">默认折叠以加快渲染，点击 ▼ 展开单个分组</span>
+        </div>
       `;
       html += groups.map(g => {
-        const mids = storage.midsOfGroup(g.tagid);
-        const list = mids.map(mid => following[mid]).filter(Boolean);
+        const list = byTag.get(Number(g.tagid)) || [];
+        const collapsed = this._collapsed.has(Number(g.tagid));
+        const key = 'g' + g.tagid;
+        const expanded = this._expandedGroups.has(key);
+        const shown = expanded ? list : list.slice(0, RENDER_LIMIT);
         return `
           <div class="bfm-group">
-            <div class="bfm-group-head" data-toggle-group="${g.tagid}">
-              <span>▼</span>
+            <div class="bfm-group-head" data-toggle-group="${g.tagid}" role="button" tabindex="0" aria-expanded="${!collapsed}" title="点击展开 / 折叠">
+              <span class="bfm-group-arrow">${collapsed ? '▶' : '▼'}</span>
               <span class="bfm-group-name">${utils.esc(g.name)}</span>
-              <span class="bfm-group-count">${mids.length}</span>
+              <span class="bfm-group-count">${list.length}</span>
               <button class="bfm-btn bfm-btn-ghost" data-rename-group="${g.tagid}">重命名</button>
               <button class="bfm-btn bfm-btn-ghost" data-delete-group="${g.tagid}">删除</button>
             </div>
-            <div class="bfm-group-body">
-              ${this._renderUpList(list.slice(0, RENDER_LIMIT))}
-              ${list.length > RENDER_LIMIT ? `<div class="bfm-empty" style="padding:8px">还有 ${list.length - RENDER_LIMIT} 个未显示</div>` : ''}
+            <div class="bfm-group-body" ${collapsed ? 'style="display:none"' : ''}>
+              ${collapsed ? '' : this._renderUpList(shown)}
+              ${!collapsed ? this._moreHint(key, list.length, shown.length, expanded) : ''}
             </div>
           </div>
         `;
@@ -2301,8 +2574,35 @@ ${sample}
       html += `<button class="bfm-btn bfm-btn-primary" data-act="new-group" style="margin-top:12px">+ 新建分组</button>`;
       body.innerHTML = html;
 
-      // 绑定事件
-      body.querySelector('[data-act="new-group"]').addEventListener('click', () => this.createGroup());
+      const newBtn = body.querySelector('[data-act="new-group"]');
+      if (newBtn) newBtn.addEventListener('click', () => this.createGroup());
+
+      // FIX v1.1：倒三角原先只有 DOM、没有任何事件绑定，点击完全没反应。
+      // 用 onclick/onkeydown 覆盖式委托（而非 addEventListener），
+      // 避免每次 render() 重复叠加监听器导致点一次折叠多次。
+      body.onclick = (e) => {
+        // FIX v1.2：分组 / 未分组区的「展开全部 / 收起」
+        const more = e.target?.closest ? e.target.closest('[data-expand-group],[data-collapse-group]') : null;
+        if (more && body.contains(more)) {
+          const key = more.dataset.expandGroup ?? more.dataset.collapseGroup;
+          if (more.dataset.expandGroup) this._expandedGroups.add(key);
+          else this._expandedGroups.delete(key);
+          this.render();
+          return;
+        }
+        const toggle = e.target?.closest ? e.target.closest('[data-toggle-group]') : null;
+        if (!toggle || !body.contains(toggle)) return;
+        const id = Number(toggle.dataset.toggleGroup);
+        if (this._collapsed.has(id)) this._collapsed.delete(id);
+        else this._collapsed.add(id);
+        this.render();
+      };
+      body.onkeydown = (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const toggle = e.target?.closest ? e.target.closest('[data-toggle-group]') : null;
+        if (toggle) { e.preventDefault(); toggle.click(); }
+      };
+
       body.querySelectorAll('[data-rename-group]').forEach(b => {
         b.addEventListener('click', e => {
           e.stopPropagation();
@@ -2315,6 +2615,29 @@ ${sample}
           this.deleteGroup(Number(b.dataset.deleteGroup));
         });
       });
+      const expandAll = body.querySelector('#bfm-expand-all-groups');
+      const collapseAll = body.querySelector('#bfm-collapse-all-groups');
+      if (expandAll) expandAll.addEventListener('click', () => { this._collapsed.clear(); this.render(); });
+      if (collapseAll) collapseAll.addEventListener('click', () => {
+        this._collapsed = new Set(groups.map(g => Number(g.tagid)));
+        this.render();
+      });
+    },
+
+    // FIX v1.2：把原来纯文字的「还有 N 个未显示」换成可点的展开 / 收起按钮
+    _moreHint(key, total, shown, expanded) {
+      const rest = total - shown;
+      if (rest > 0) {
+        return `<div class="bfm-empty" style="padding:8px">还有 ${rest} 个未显示
+          <button type="button" class="bfm-btn bfm-btn-ghost" data-expand-group="${key}"
+            style="padding:2px 10px;font-size:11px;margin-left:8px">展开全部 ${total} 位</button></div>`;
+      }
+      if (expanded && total > 100) {
+        return `<div class="bfm-empty" style="padding:8px">已显示全部 ${total} 位
+          <button type="button" class="bfm-btn bfm-btn-ghost" data-collapse-group="${key}"
+            style="padding:2px 10px;font-size:11px;margin-left:8px">收起</button></div>`;
+      }
+      return '';
     },
 
     _renderUpList(list) {
@@ -2324,11 +2647,18 @@ ${sample}
         const meta = u.lastActive
           ? `<span class="bfm-up-meta ${days > CONFIG.INACTIVE_DAYS ? 'bfm-inactive' : ''}">活跃 ${utils.formatDays(days)}</span>`
           : `<span class="bfm-up-meta">未检测</span>`;
+        // FIX v1.2：点头像或右侧按钮直达「动态空间」/dynamic，而不是主空间
+        const dyn = `https://space.bilibili.com/${u.mid}/dynamic`;
         return `
           <div class="bfm-up" data-mid="${u.mid}">
-            <img src="${utils.esc(u.face)}" loading="lazy" onerror="this.style.visibility='hidden'">
+            <a class="bfm-up-face-link" href="${dyn}" target="_blank" rel="noopener"
+               title="打开 ${utils.esc(u.uname)} 的动态空间" style="display:block;flex-shrink:0">
+              <img src="${utils.esc(u.face)}" loading="lazy" onerror="this.style.visibility='hidden'">
+            </a>
             <div class="bfm-up-name">${utils.esc(u.uname)}</div>
             ${meta}
+            <a class="bfm-btn bfm-btn-ghost bfm-btn-icon bfm-up-dyn" href="${dyn}" target="_blank" rel="noopener"
+               title="查看动态空间（/dynamic）" style="flex-shrink:0">↗</a>
           </div>
         `;
       }).join('');
@@ -2412,7 +2742,11 @@ ${sample}
         const normalCount = normal.length;
         // "只看特别关注" toggle 状态：默认 false（看全部）
         this._starredOnly = this._starredOnly || false;
-        const visibleDead = this._starredOnly ? starred : dead;
+        // FAST v1：与分组页一致加渲染上限，避免上千行 DOM + 无限 CSS 动画拖死主线程
+        const RENDER_LIMIT = CONFIG.INACTIVE_RENDER_LIMIT;
+        const matchedDead = this._starredOnly ? starred : dead;
+        const visibleDead = matchedDead.slice(0, this._showAllDead ? matchedDead.length : RENDER_LIMIT);
+        const hiddenDead = matchedDead.length - visibleDead.length;
 
         html += `
           <div class="bfm-section-title">超过 ${threshold} 天未更新 (${dead.length})</div>
@@ -2428,6 +2762,10 @@ ${sample}
           ${visibleDead.length === 0
             ? `<div class="bfm-empty">${this._starredOnly ? '没有特别关注的死粉' : '没有死粉'}</div>`
             : visibleDead.map(renderDeadUp).join('')}
+          ${hiddenDead > 0
+            ? `<div class="bfm-empty" style="padding:8px">还有 ${hiddenDead} 个未显示
+                <button class="bfm-btn bfm-btn-ghost" id="bfm-show-all-dead" style="padding:2px 8px;font-size:11px;margin-left:8px">显示全部</button></div>`
+            : ''}
         `;
       }
       if (undetected.length) {
@@ -2435,7 +2773,7 @@ ${sample}
           <div class="bfm-section-title">尚未检测活跃度 (${undetected.length})</div>
           <div class="bfm-modal-note" style="margin-bottom:8px">
             这些 UP 主还没有最新视频时间数据。<br>
-            点击下方按钮或顶栏"活跃度"刷新（约 ${Math.ceil(undetected.length * 0.2)} 秒）。
+            点击顶栏"活跃度"或下方按钮增量刷新（仅检测未检测及到期的 UP 主）。
           </div>
           <button class="bfm-btn bfm-btn-primary" id="bfm-refresh-undetected" style="width:100%">
             一键刷新 ${undetected.length} 位 UP 主的活跃度
@@ -2493,6 +2831,11 @@ ${sample}
 
       // 死粉区交互
       if (dead.length) {
+        const showAllBtn = body.querySelector('#bfm-show-all-dead');
+        if (showAllBtn) showAllBtn.addEventListener('click', () => {
+          this._showAllDead = true;
+          this.render();
+        });
         const checkboxes = body.querySelectorAll('.bfm-dead-cb');
         const countEl = body.querySelector('#bfm-selected-count');
         const unfollowBtn = body.querySelector('#bfm-batch-unfollow');
@@ -2538,8 +2881,12 @@ ${sample}
             btn.classList.toggle('is-starred', !cur);
             btn.textContent = !cur ? '★' : '☆';
             btn.title = !cur ? '取消特别关注' : '标为特别关注';
-            // 更新顶部 "⭐ N" 计数
-            this.render();
+            // FAST v1：只更新顶部计数，不再整表重渲染（原实现每点一下重建上千行 DOM）
+            const badge = this.panelEl?.querySelector('#bfm-starred-only');
+            if (badge) {
+              const n = storage.getInactiveCandidates().filter(x => x.starred).length;
+              badge.textContent = `⭐ ${n}`;
+            }
           });
         });
 
@@ -2889,13 +3236,14 @@ ${sample}
       }
     },
 
-    async runInactiveRefresh() {
+    async runInactiveRefresh(opts = {}) {
       if (!Object.keys(storage.state.following).length) {
         alert('请先同步关注列表');
         return;
       }
       try {
-        await sync.refreshInactive();
+        const r = await sync.refreshInactive(opts);
+        if (r?.aborted) utils.warn('活跃度刷新已中止', r);
         this.render();
       } catch (e) {
         utils.error(e);
@@ -3657,6 +4005,9 @@ ${sample}
       if (this.mounted) return;
       this.mounted = true;
       utils.log('inject dynamic page');
+      // FIX v1.3：v1.2 事故后可能残留 display:none 的整页容器，
+      // 脚本一加载就无条件撤销，保证即使不手动操作也能恢复显示。
+      try { this._clearHidden(); } catch (e) { utils.warn('清除残留隐藏失败', e); }
       this._injectTabs();
       this._observeTabs();
 
@@ -3687,71 +4038,292 @@ ${sample}
 
     _renderTabsInto(host) {
       if (document.getElementById('bfm-group-tabs')) return;
-      const groups = storage.state.groups;
+      const groups = storage.state.groups || [];
       if (!groups.length) return;
 
       const wrap = document.createElement('div');
       wrap.id = 'bfm-group-tabs';
-      wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px;background:#fafafa;border-bottom:1px solid #eee;align-items:center;font-size:13px';
-      const render = (activeId) => {
-        const items = groups.map(g => {
-          const cnt = storage.midsOfGroup(g.tagid).length;
-          const active = activeId === g.tagid;
-          return `<button data-gid="${g.tagid}" style="padding:4px 12px;border-radius:14px;border:1px solid ${active ? '#00aeec' : '#ddd'};background:${active ? '#00aeec' : '#fff'};color:${active ? '#fff' : '#333'};cursor:pointer;font-size:12px">
-            ${utils.esc(g.name)} (${cnt})
-          </button>`;
-        }).join('');
-        wrap.innerHTML = `<span style="color:var(--bfm-text-3);font-size:12px;margin-right:8px;font-weight:500">分组筛选</span>
-          <button data-gid="__none__" style="padding:4px 12px;border-radius:14px;border:1px solid ${!activeId ? '#00aeec' : '#ddd'};background:${!activeId ? '#00aeec' : '#fff'};color:${!activeId ? '#fff' : '#333'};cursor:pointer;font-size:12px">全部</button>
-          ${items}`;
-        wrap.querySelectorAll('[data-gid]').forEach(b => {
-          b.addEventListener('click', () => {
-            const gid = b.dataset.gid === '__none__' ? null : Number(b.dataset.gid);
-            this.activeGroup = gid;
-            render(gid);
-            this._applyFilter();
-          });
-        });
-      };
-      render(null);
+      // FIX v1.1：补 position / z-index / pointer-events，避免被 B 站浮层拦截点击
+      wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px;background:#fafafa;border-bottom:1px solid #eee;align-items:center;font-size:13px;position:relative;z-index:5;pointer-events:auto';
+      const self = this;
+      // FIX v1.1：事件委托只绑一次。原实现每次 innerHTML 重建后重新逐按钮绑定，
+      // B 站重渲染或多次切换后监听容易丢失，表现为「按钮点了没反应」。
+      wrap.addEventListener('click', (e) => {
+        const btn = e.target?.closest ? e.target.closest('[data-gid]') : null;
+        if (!btn || !wrap.contains(btn)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        self._pickGroup(btn.dataset.gid === '__none__' ? null : Number(btn.dataset.gid));
+      });
+      this._tabsEl = wrap;
+      this._renderButtons(wrap, this.activeGroup ?? null);
       host.prepend(wrap);
     },
 
+    _renderButtons(wrap, activeId) {
+      const groups = storage.state.groups || [];
+      const style = (active) => `padding:4px 12px;border-radius:14px;border:1px solid ${active ? '#00aeec' : '#ddd'};background:${active ? '#00aeec' : '#fff'};color:${active ? '#fff' : '#333'};cursor:pointer;font-size:12px;pointer-events:auto`;
+      const mk = (gid, label, active) =>
+        `<button type="button" data-gid="${gid}" style="${style(active)}">${utils.esc(label)}</button>`;
+      // 直接用 B 站官方返回的 count，不再对每个分组全表扫描 midsOfGroup()
+      let html = `<span style="color:#999;font-size:12px;margin-right:8px;font-weight:500">分组筛选</span>`
+        + mk('__none__', '全部', activeId == null);
+      for (const g of groups) {
+        html += mk(g.tagid, `${g.name} (${g.count ?? 0})`, activeId === g.tagid);
+      }
+      wrap.innerHTML = html;
+    },
+
+    // FIX v1.2：点分组后「过滤动态流」与「自绘分组速览」两条路都走。
+    // 过滤依赖 B 站 DOM，改版即失效；速览完全由本脚本数据渲染，保证一定看得到该组 UP。
+    _pickGroup(gid) {
+      if (this._lastPeekGid !== gid) {
+        this._peekAll = false;
+        this._lastPeekGid = gid;
+      }
+      this.activeGroup = gid;
+      if (this._tabsEl) this._renderButtons(this._tabsEl, gid);
+      this._renderPeek(gid);
+      this._applyFilter();
+    },
+
+    _renderPeek(gid) {
+      let peek = document.getElementById('bfm-group-peek');
+      if (gid == null) {
+        if (peek) peek.style.display = 'none';
+        return;
+      }
+      if (!peek) {
+        peek = document.createElement('div');
+        peek.id = 'bfm-group-peek';
+        peek.style.cssText = 'margin:0 12px 10px;padding:12px;background:#fff;border:1px solid #e5e7eb;border-radius:10px;font-size:13px;position:relative;z-index:5;pointer-events:auto;box-shadow:0 2px 8px rgba(0,0,0,.05)';
+        const host = this._tabsEl?.parentElement;
+        if (host) host.insertBefore(peek, this._tabsEl.nextSibling);
+        else return;
+      }
+      peek.style.display = 'block';
+      const g = (storage.state.groups || []).find(x => x.tagid === gid);
+      const following = storage.state.following || {};
+      const users = storage.midsOfGroup(gid).map(m => following[m]).filter(Boolean);
+      const LIMIT = 24;
+      const shown = this._peekAll ? users : users.slice(0, LIMIT);
+      const items = shown.map(u => {
+        const dyn = `https://space.bilibili.com/${u.mid}/dynamic`;
+        const meta = u.lastActive ? `活跃 ${utils.formatDays(utils.daysSince(u.lastActive))}` : '未检测';
+        return `<a href="${dyn}" target="_blank" rel="noopener" title="打开 ${utils.esc(u.uname)} 的动态空间"
+          style="display:inline-flex;align-items:center;gap:6px;width:calc(50% - 6px);min-width:180px;padding:5px 6px;border-radius:8px;text-decoration:none;color:#0f172a;background:#f8fafc;margin:3px;border:1px solid #eef2f6;box-sizing:border-box">
+          <img src="${utils.esc(u.face)}" loading="lazy" style="width:26px;height:26px;border-radius:50%;object-fit:cover;flex-shrink:0;background:#e5e7eb">
+          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px">${utils.esc(u.uname)}</span>
+          <span style="font-size:10.5px;color:#94a3b8;white-space:nowrap">${meta}</span>
+        </a>`;
+      }).join('');
+      const more = users.length > LIMIT
+        ? `<button type="button" data-peek-toggle style="margin-left:8px;padding:3px 10px;border:1px solid #00aeec;background:#fff;color:#00aeec;border-radius:12px;cursor:pointer;font-size:11px">${this._peekAll ? '收起' : `展开全部 ${users.length} 位`}</button>`
+        : '';
+      peek.innerHTML = `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+          <b style="font-size:13px">分组「${utils.esc(g?.name || '')}」· ${users.length} 位 UP</b>
+          <span style="font-size:11px;color:#94a3b8">点头像直达动态空间 /dynamic</span>
+          ${more}
+          <button type="button" data-peek-hide style="padding:3px 10px;border:1px solid #d1d5db;background:#fff;color:#475569;border-radius:12px;cursor:pointer;font-size:11px">尝试过滤动态流</button>
+          <button type="button" data-peek-unhide style="padding:3px 10px;border:1px solid #d1d5db;background:#fff;color:#475569;border-radius:12px;cursor:pointer;font-size:11px">恢复显示</button>
+          <button type="button" data-peek-close style="margin-left:auto;border:none;background:transparent;color:#94a3b8;cursor:pointer;font-size:13px">收起速览 ✕</button>
+        </div>
+        <div style="font-size:11px;color:#94a3b8;margin:-2px 0 6px">动态流隐藏默认关闭（避免误隐藏整页）；需要时点「尝试过滤动态流」，异常随时点「恢复显示」或 Console 执行 BFM.unhide()</div>
+        <div style="display:flex;flex-wrap:wrap">${items || '<span style="color:#94a3b8;padding:8px">该分组暂无已同步的 UP 主，请先在面板点「同步」</span>'}</div>`;
+      peek.onclick = (e) => {
+        if (e.target?.closest?.('[data-peek-toggle]')) {
+          this._peekAll = !this._peekAll;
+          this._renderPeek(gid);
+        } else if (e.target?.closest?.('[data-peek-hide]')) {
+          CONFIG.ENABLE_FEED_HIDE = true;
+          this._applyFilter();
+          this._renderPeek(gid);
+        } else if (e.target?.closest?.('[data-peek-unhide]')) {
+          CONFIG.ENABLE_FEED_HIDE = false;
+          this._clearHidden();
+          this._applyFilter();
+          this._renderPeek(gid);
+        } else if (e.target?.closest?.('[data-peek-close]')) {
+          peek.style.display = 'none';
+        }
+      };
+    },
+
+    debug() {
+      const cards = this._findCards();
+      return {
+        tabsPresent: !!document.getElementById('bfm-group-tabs'),
+        peekPresent: !!document.getElementById('bfm-group-peek'),
+        activeGroup: this.activeGroup,
+        groups: (storage.state.groups || []).length,
+        cardsFound: cards.size,
+        cardsScanned: this._lastCards ?? -1,
+        nameMatches: this._lastNameMatches ?? -1,
+        linksFound: this._lastLinks ?? -1,
+        listRoots: this._lastRoots ?? -1,
+        sample: [...cards.entries()].slice(0, 5).map(([el, mid]) => ({
+          mid, tag: el.tagName, cls: String(el.className || '').slice(0, 80),
+        })),
+      };
+    },
+
     _observeTabs() {
-      // 当动态列表变化时重新应用过滤
-      const list = document.querySelector('.bili-dyn-list, .dynamic-list, [class*="bili-dyn-list"]');
-      if (!list) return;
-      this._observer = new MutationObserver(utils.debounce(() => this._applyFilter(), 200));
-      this._observer.observe(list, { childList: true, subtree: true });
+      if (this._observer) this._observer.disconnect();
+      // FIX v1.1：观察 document.body 而非某个可能已失效的列表容器；
+      // B 站 SPA 重渲染移除 tab 时自动补回，有新动态时重新应用过滤。
+      let pending = false;
+      this._observer = new MutationObserver(() => {
+        if (pending) return;
+        pending = true;
+        setTimeout(() => {
+          pending = false;
+          if (!document.getElementById('bfm-group-tabs')) {
+            const host = document.querySelector('.bili-dyn-list, .dynamic-list, [class*="bili-dyn-list"]')?.parentElement
+                      || document.querySelector('.bili-dyn-list-tabs, .tab-bar, .nav-tabs, [class*="tab-list"]');
+            if (host) this._renderTabsInto(host);
+          }
+          if (this.activeGroup != null) {
+            // FIX v1.2：SPA 重渲染把速览面板也移除时自动补回
+            if (!document.getElementById('bfm-group-peek')) this._renderPeek(this.activeGroup);
+            // FIX v1.3：默认关闭时不要周期性触发 DOM 遍历
+            if (CONFIG.ENABLE_FEED_HIDE) this._applyFilter();
+          }
+        }, 300);
+      });
+      this._observer.observe(document.body, { childList: true, subtree: true });
     },
 
     _applyFilter() {
-      if (this.activeGroup == null) {
-        document.querySelectorAll('.bfm-hidden-by-group').forEach(el => el.classList.remove('bfm-hidden-by-group'));
-        return;
+      // 分片到下一个宏任务，避免点击处理与 DOM 遍历挤在同一长任务里
+      if (this._filterTimer) clearTimeout(this._filterTimer);
+      this._filterTimer = setTimeout(() => this._applyFilterNow(), 0);
+    },
+
+    _findCards() {
+      // FIX v1.4：用无头 Chrome 实抓 t.bilibili.com 的真实 DOM 得到的结构：
+      //   .bili-dyn-list > .bili-dyn-list__items > .bili-dyn-list__item > .bili-dyn-item
+      //   作者 mid 在 .bili-dyn-item__following[data-mid] 上，
+      //   而 a[href*="space.bilibili.com"] 数量为 0 —— 旧实现因此永远返回 0 张卡片。
+      // 改为「按明确的卡片 class 枚举 + 从卡片内取 mid」，不再猜祖先。
+      const cards = new Map();
+      const CARD_SEL = '.bili-dyn-list__item, .bili-dyn-item';
+      const all = [...document.querySelectorAll(CARD_SEL)]
+        .filter(el => el && !el.closest?.('#bfm-group-peek, #bfm-group-tabs'));
+      // 登录态下已关注的 UP 不再渲染「关注按钮」（[data-mid] 跟随模块），
+      // 所以另建一份「昵称 -> mid」索引兜底：作者名在 .bili-dyn-title__text 纯文本里。
+      const following = storage.state.following || {};
+      const followCount = Object.keys(following).length;
+      if (!this._nameIndex || this._nameIndexCount !== followCount) {
+        const idx = new Map();
+        for (const u of Object.values(following)) {
+          if (!u || !u.uname) continue;
+          const key = String(u.uname).trim();
+          if (key && !idx.has(key)) idx.set(key, u.mid);
+        }
+        this._nameIndex = idx;
+        this._nameIndexCount = followCount;
       }
-      const mids = new Set(storage.midsOfGroup(this.activeGroup));
-      const cards = document.querySelectorAll('.bili-dyn-list .bili-dyn-item, .dynamic-list .dynamic-item, [class*="bili-dyn-item"]');
-      let hidden = 0;
-      cards.forEach(card => {
-        const link = card.querySelector('a[href*="space.bilibili.com"]');
-        const m = link?.href.match(/space\.bilibili\.com\/(\d+)/);
-        if (!m) return;
-        const mid = Number(m[1]);
-        const isMember = mids.has(mid);
-        card.classList.toggle('bfm-hidden-by-group', !isMember);
-        if (!isMember) hidden++;
+      this._lastLinks = document.querySelectorAll('a[href*="space.bilibili.com"]').length;
+      this._lastRoots = document.querySelectorAll('.bili-dyn-list, .bili-dyn-list__items').length;
+      this._lastCards = all.length;
+      this._lastNameMatches = 0;
+      for (const card of all) {
+        // 归一到最外层 .bili-dyn-list__item，避免同一张卡片被两个选择器重复计入
+        const outer = card.closest?.('.bili-dyn-list__item') || card;
+        if (outer === document.body || outer === document.documentElement) continue;
+        if (outer.closest?.('#bfm-group-peek, #bfm-group-tabs')) continue;
+        let mid = 0, byName = false;
+        // 路径 1：未登录/未关注卡片里的 [data-mid]
+        const dm = outer.querySelector?.('[data-mid]');
+        if (dm) mid = Number(dm.getAttribute('data-mid'));
+        // 路径 2：部分版本用空间链接
+        if (!mid) {
+          const a = outer.querySelector?.('a[href*="space.bilibili.com"]');
+          const href = a?.getAttribute?.('href') || a?.href || '';
+          const m = String(href).match(/space\.bilibili\.com\/(\d+)/);
+          if (m) mid = Number(m[1]);
+        }
+        // 路径 3（登录态关键）：按作者昵称反查
+        if (!mid) {
+          const nameEl = outer.querySelector?.('.bili-dyn-title__text, [data-module="title"]');
+          const name = String(nameEl?.textContent || '').trim();
+          if (name && this._nameIndex.has(name)) {
+            mid = this._nameIndex.get(name);
+            byName = true;
+          }
+        }
+        if (Number.isFinite(mid) && mid > 0 && !cards.has(outer)) {
+          cards.set(outer, mid);
+          if (byName) this._lastNameMatches++;
+        }
+      }
+      return cards;
+    },
+
+    _clearHidden() {
+      document.querySelectorAll('.bfm-hidden-by-group').forEach(el => {
+        el.classList.remove('bfm-hidden-by-group');
+        el.style?.removeProperty('display');
       });
-      // 顶部提示（放 shadow 里，躲 B 站检测）
+    },
+
+    _ensureTip() {
       let tip = this.shadow?.getElementById('bfm-filter-tip') || document.getElementById('bfm-filter-tip');
       if (!tip) {
         tip = document.createElement('div');
         tip.id = 'bfm-filter-tip';
-        tip.style.cssText = 'position:fixed;top:8px;right:8px;background:#00aeec;color:#fff;padding:4px 10px;border-radius:14px;font-size:12px;z-index:9999;box-shadow:0 2px 6px rgba(0,0,0,.15);pointer-events:auto';
+        tip.style.cssText = 'position:fixed;top:8px;right:8px;background:#00aeec;color:#fff;padding:4px 10px;border-radius:14px;font-size:12px;z-index:9999;box-shadow:0 2px 6px rgba(0,0,0,.15);pointer-events:none';
         (this.shadow || document.body).appendChild(tip);
       }
-      const g = storage.state.groups.find(g => g.tagid === this.activeGroup);
-      tip.textContent = `仅显示分组：${g?.name || ''}（已隐藏 ${hidden} 条）`;
+      return tip;
+    },
+
+    _applyFilterNow() {
+      const tip = this._ensureTip();
+      // FIX v1.3：每次先无条件撤销上一轮隐藏，保证任何误藏都能被下一次点击恢复
+      this._clearHidden();
+      const g = (storage.state.groups || []).find(x => x.tagid === this.activeGroup);
+      if (this.activeGroup == null) {
+        tip.style.display = 'none';
+        return;
+      }
+      // 默认完全不碰 B 站 DOM，只靠「分组速览」呈现该组 UP。
+      // 用户可在速览里手动点「尝试过滤动态流」开启。
+      if (!CONFIG.ENABLE_FEED_HIDE) {
+        tip.style.display = 'block';
+        tip.textContent = `分组「${g?.name || ''}」：请在下方「分组速览」查看该组 UP（动态流隐藏默认关闭）`;
+        return;
+      }
+      const mids = new Set(storage.midsOfGroup(this.activeGroup));
+      const cards = this._findCards();
+      const tabsEl = document.getElementById('bfm-group-tabs');
+      // 安全熔断（v1.4）：候选节点必须匹配明确的卡片 class，且不能包含脚本注入的 tab 栏，
+      // 从结构上杜绝「隐藏整页」。取消高度阈值 —— 长图文动态卡片本身可能高于视口，旧判据会误伤。
+      const isCard = (el) => /bili-dyn-list__item|bili-dyn-item/.test(String(el.className || ''));
+      const unsafe = [...cards.keys()].some(el =>
+        !isCard(el) ||
+        el === document.body || el === document.documentElement ||
+        (tabsEl && el.contains?.(tabsEl))
+      );
+      if (!cards.size || unsafe) {
+        tip.style.display = 'block';
+        tip.textContent = `分组「${g?.name || ''}」：未识别到动态卡片（已跳过隐藏，请用下方分组速览）`;
+        utils.warn('[BFM] 跳过动态流隐藏', { cards: cards.size, scanned: this._lastCards, roots: this._lastRoots });
+        return;
+      }
+      let hidden = 0, matched = 0;
+      for (const [card, mid] of cards) {
+        const isMember = mids.has(mid);
+        card.classList.toggle('bfm-hidden-by-group', !isMember);
+        if (card.style) {
+          if (isMember) card.style.removeProperty('display');
+          else card.style.setProperty('display', 'none', 'important');
+        }
+        if (isMember) matched++; else hidden++;
+      }
+      tip.style.display = 'block';
+      tip.textContent = `仅显示分组：${g?.name || ''}（保留 ${matched} / 隐藏 ${hidden}）｜下方速览可查看全部 ${mids.size} 位 UP`;
+      utils.log('[BFM] 分组筛选', { group: g?.name, cards: cards.size, matched, hidden });
     },
   };
 
@@ -3777,6 +4349,13 @@ ${sample}
         inactive: () => ui.runInactiveRefresh(),
         export: () => ui.exportData(),
         import: () => ui.importData(),
+        filter: () => injectDynamicPage.debug(),
+        // FIX v1.3：一键撤销所有动态流隐藏，页面异常时无需刷新即可恢复
+        unhide: () => {
+          CONFIG.ENABLE_FEED_HIDE = false;
+          injectDynamicPage._clearHidden();
+          return '已恢复显示（动态流隐藏已关闭）';
+        },
         debug: () => ({
             fab: ui.shadow?.querySelector('.bfm-fab'),
             panel: ui.panelEl,
