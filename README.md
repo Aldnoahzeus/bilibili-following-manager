@@ -1,5 +1,12 @@
 # B 站关注管理助手 (bilibili-following-manager)
 
+---
+遇到初始化加载过慢的问题，减小批次，增加中断，增量更新
+
+---
+以下是原作者原版说明
+
+
 > 一个油猴脚本，让你的关注列表井井有条——批量分组、动态页分组筛选、死粉识别、AI 智能分类、断点续传。
 >
 > 配套独立项目：[**bilibili-home-cleaner**](https://github.com/Franklinyung/bilibili-home-cleaner) — 隐藏首页轮播广告、"短视频"Tab、给视频卡片加分类标签、按分类浏览。与本脚本互不干扰，建议同时启用。
@@ -7,7 +14,9 @@
 **GitHub**：https://github.com/Franklinyung/bilibili-following-manager
 **当前版本**：v0.10.6 · **测试**：171 / 171 通过 · 9 / 9 smoke 通过
 
----
+
+——————
+
 
 ## 为什么需要它
 
